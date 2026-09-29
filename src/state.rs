@@ -42,7 +42,13 @@ pub struct AppState {
     // Timing
     pub last_update: Instant,
     pub last_block_time: Option<Instant>,
-    last_block_number: u64,
+    // One watermark per source, not one shared. `update_metrics` reads the execution
+    // ledger height and `update_rpc` reads the subscription tip: two measurements of the
+    // same node, taken by independent pollers from the same loop, so at a 400 ms block
+    // they disagree by a block routinely. Sharing one watermark makes that ordinary
+    // disagreement look like a restart followed by a new block, on every cycle.
+    last_metrics_height: u64,
+    last_rpc_height: u64,
 
     // Metrics polls in a row that brought no new TPS sample. Once a full
     // window's worth pass without one, the window describes the past, not the
@@ -109,7 +115,8 @@ impl AppState {
             tps_prev: 0.0,
             last_update: Instant::now(),
             last_block_time: None,
-            last_block_number: 0,
+            last_metrics_height: 0,
+            last_rpc_height: 0,
             polls_since_sample: 0,
             last_rpc_block_at: None,
             ws_connected: false,
@@ -156,10 +163,11 @@ impl AppState {
         // must not refresh the "last block seen" clock the staleness display
         // hangs off.
         if let Some(block_num) = metrics.block_num {
-            if block_num > self.last_block_number {
-                self.last_block_time = Some(Instant::now());
-                self.last_block_number = block_num;
-            }
+            Self::note_height(
+                &mut self.last_metrics_height,
+                &mut self.last_block_time,
+                block_num,
+            );
         }
 
         // Add TX sample for TPS calculation
@@ -234,12 +242,15 @@ impl AppState {
     }
 
     pub fn update_rpc(&mut self, rpc_data: RpcData) {
-        // Also update last block time from RPC if we have blocks
+        // Also update last block time from RPC if we have blocks. Same rule as the
+        // metrics path, and deliberately the same code: both write one field, so a
+        // rule kept in only one of them is a rule the other can undo.
         if let Some(block) = rpc_data.recent_blocks.first() {
-            if block.number > self.last_block_number {
-                self.last_block_time = Some(Instant::now());
-                self.last_block_number = block.number;
-            }
+            Self::note_height(
+                &mut self.last_rpc_height,
+                &mut self.last_block_time,
+                block.number,
+            );
         }
 
         if rpc_data.block_number.is_some() {
@@ -299,6 +310,38 @@ impl AppState {
 
         self.system = system;
         self.system_seen = true;
+    }
+
+    /// Record one source's height reading and decide whether it is a new block.
+    ///
+    /// `watermark` belongs to the source that produced `height` — the execution ledger
+    /// for the metrics poll, the subscription tip for the WebSocket. It is a watermark
+    /// and not a display value: nothing outside `AppState` reads either of them, and
+    /// their only job is to answer "has THIS source moved forward?" for the clock the
+    /// staleness line and the block pulse hang off.
+    ///
+    /// Per source, because the two disagree by a block in normal operation. A single
+    /// watermark turns that disagreement into a restart and a new block on every cycle,
+    /// which keeps the clock fresh on a node that has stopped — the failure the clock
+    /// exists to show.
+    ///
+    /// A height above this source's watermark is a new block and moves both.
+    ///
+    /// A height below it is that source starting over: a node resynced from a snapshot
+    /// or a fresh data directory, or a different node behind the same address. The
+    /// watermark follows it down, because one left at a maximum the node will not reach
+    /// again rejects every later reading and freezes the clock for the rest of the
+    /// session. The clock does not move here — a counter that went backwards is not a
+    /// block arriving, and the next height above this one is what says one did.
+    ///
+    /// An equal height is neither, which is the ordinary case between blocks.
+    fn note_height(watermark: &mut u64, clock: &mut Option<Instant>, height: u64) {
+        if height > *watermark {
+            *clock = Some(Instant::now());
+            *watermark = height;
+        } else if height < *watermark {
+            *watermark = height;
+        }
     }
 
     fn calculate_tps(&mut self) {
@@ -835,7 +878,7 @@ mod tests {
             ..Default::default()
         });
         let seen_at = state.last_block_time;
-        assert_eq!(state.last_block_number, 4200);
+        assert_eq!(state.last_metrics_height, 4200);
         assert!(seen_at.is_some());
 
         state.update_metrics(PrometheusMetrics {
@@ -844,7 +887,7 @@ mod tests {
         });
 
         assert_eq!(
-            state.last_block_number, 4200,
+            state.last_metrics_height, 4200,
             "an unread height moved the height"
         );
         assert_eq!(
@@ -859,6 +902,11 @@ mod tests {
         // height, or reports an older one, has not seen one -- and a repeated
         // height is the normal case between blocks, so getting this wrong would
         // make every poll look like a block.
+        //
+        // The watermark is a separate question from the clock, and #59 separated the
+        // two: a repeated height leaves it where it is, a lower one follows it down so
+        // that a source which started over cannot reject every later reading. Every
+        // clock assertion below is the original one, unchanged.
         let mut state = AppState::new();
         state.update_metrics(PrometheusMetrics {
             block_num: Some(4200),
@@ -866,12 +914,24 @@ mod tests {
         });
         let seen_at = state.last_block_time;
 
-        for height in [4200, 4199, 0] {
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(4200),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.last_metrics_height, 4200,
+            "a repeated height moved the watermark"
+        );
+        assert_eq!(
+            state.last_block_time, seen_at,
+            "a repeated height refreshed the clock"
+        );
+
+        for height in [4199, 0] {
             state.update_metrics(PrometheusMetrics {
                 block_num: Some(height),
                 ..Default::default()
             });
-            assert_eq!(state.last_block_number, 4200, "{} moved the height", height);
             assert_eq!(
                 state.last_block_time, seen_at,
                 "{} refreshed the clock",
@@ -883,7 +943,7 @@ mod tests {
             block_num: Some(4201),
             ..Default::default()
         });
-        assert_eq!(state.last_block_number, 4201);
+        assert_eq!(state.last_metrics_height, 4201);
         assert_ne!(
             state.last_block_time, seen_at,
             "a new block did not move the clock"
@@ -994,6 +1054,164 @@ mod tests {
 
         assert_eq!(state.peers_trend(), 0);
         assert_eq!(LARGEST.checked_add(5), Some(18_446_744_073_709_549_573));
+    }
+
+    /// Build one RPC reading carrying a single block at `n`.
+    fn rpc_at(n: u64) -> RpcData {
+        RpcData {
+            recent_blocks: vec![Block {
+                number: n,
+                hash: String::new(),
+                tx_count: 0,
+                timestamp: 0,
+                gas_used: 0,
+                gas_limit: 0,
+            }],
+            block_number: Some(n),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_height_that_comes_back_lower_does_not_freeze_the_metrics_clock() {
+        // A node resynced from a snapshot, or a different node behind the same address,
+        // reports a height far below the one already seen. The watermark has to follow
+        // it down; left at the old maximum it rejects every later reading and the
+        // staleness line counts up for the rest of the session.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(1_000),
+            ..Default::default()
+        });
+        let seen_at = state.last_block_time;
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.last_block_time, seen_at,
+            "a counter that went backwards is not a block arriving"
+        );
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(11),
+            ..Default::default()
+        });
+        assert_ne!(
+            state.last_block_time, seen_at,
+            "the first block after the restart did not reach the clock"
+        );
+    }
+
+    #[test]
+    fn a_height_that_comes_back_lower_does_not_freeze_the_rpc_clock() {
+        // Same rule on the subscription path. The two writers share one field, so a
+        // rule kept in only one of them is a rule the other can undo.
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        let seen_at = state.last_block_time;
+
+        state.update_rpc(rpc_at(10));
+        assert_eq!(state.last_block_time, seen_at, "the drop moved the clock");
+
+        state.update_rpc(rpc_at(11));
+        assert_ne!(
+            state.last_block_time, seen_at,
+            "the first block after the restart did not reach the clock"
+        );
+    }
+
+    #[test]
+    fn two_sources_that_disagree_by_a_block_do_not_fake_new_ones() {
+        // The two readings are independent measurements of one node -- the execution
+        // ledger height and the subscription tip -- polled separately from the same
+        // loop, so at a 400 ms block they sit a block apart as a matter of course. On a
+        // node that has STOPPED, that standing disagreement must produce nothing: with
+        // one shared watermark it reads as a restart followed by a new block, every
+        // cycle, and the staleness line shows a fresh block on a dead node.
+        let mut state = AppState::new();
+        // Both sources report once first: a source's very first reading is new to it by
+        // definition, and that is not what this is about.
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(1_000),
+            ..Default::default()
+        });
+        state.update_rpc(rpc_at(1_001));
+        let seen_at = state.last_block_time;
+
+        for _ in 0..10 {
+            state.update_metrics(PrometheusMetrics {
+                block_num: Some(1_000),
+                ..Default::default()
+            });
+            state.update_rpc(rpc_at(1_001));
+        }
+
+        assert_eq!(
+            state.last_block_time, seen_at,
+            "a stopped node reported a new block from two sources disagreeing"
+        );
+    }
+
+    #[test]
+    fn each_source_recovers_from_a_restart_on_its_own_readings() {
+        // A restart reaches the two pollers separately, and neither can vouch for the
+        // other: a subscription reading below its own watermark is that source starting
+        // over, whatever the metrics poll has seen. So each recovers on its own second
+        // post-restart reading rather than on the other's first.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(1_000),
+            ..Default::default()
+        });
+        state.update_rpc(rpc_at(1_000));
+        let seen_at = state.last_block_time;
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(10),
+            ..Default::default()
+        });
+        state.update_rpc(rpc_at(11));
+        assert_eq!(
+            state.last_block_time, seen_at,
+            "the first reading each source takes after a restart is a baseline, not a block"
+        );
+
+        state.update_rpc(rpc_at(12));
+        assert_ne!(
+            state.last_block_time, seen_at,
+            "the subscription's second post-restart block did not reach the clock"
+        );
+    }
+
+    #[test]
+    fn a_one_block_reorg_recovers_on_the_next_block() {
+        // Not the case this is about, but the same code path, and the cheap way to say
+        // what the rule costs: 100 -> 99 -> 100 used to wait for 101, because 100 was
+        // not above the old maximum. It now resumes on the block that follows the
+        // shorter branch.
+        let mut state = AppState::new();
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(100),
+            ..Default::default()
+        });
+        let seen_at = state.last_block_time;
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(99),
+            ..Default::default()
+        });
+        assert_eq!(state.last_block_time, seen_at, "the reorg moved the clock");
+
+        state.update_metrics(PrometheusMetrics {
+            block_num: Some(100),
+            ..Default::default()
+        });
+        assert_ne!(
+            state.last_block_time, seen_at,
+            "the block after the reorg did not reach the clock"
+        );
     }
 
     #[test]
